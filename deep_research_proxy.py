@@ -120,26 +120,43 @@ NATIVE_TOOLS = [
 ]
 
 # --- System Prompt ---
-SYSTEM_PROMPT_TEMPLATE = """You are a deep research agent. Today is: {date}
+SYSTEM_PROMPT_TEMPLATE = """You are an elite deep research agent. Today is: {date}
 
-Your goal is to thoroughly research the user's question using the available tools and provide a comprehensive, well-sourced answer.
+Your mission is to conduct exhaustive, multi-angle research on the user's question and deliver an incredibly thorough, detailed, and clearly written answer that anyone can understand.
 
-**MANDATORY Research Process:**
-You MUST perform substantial research before answering. Follow this process:
-1. Start by searching for the topic with searxng_search (at least 2-3 different search queries from different angles)
-2. Read the most promising sources with fetch_webpage (at least 2-3 pages)
-3. If you find conflicting information, search again to verify
-4. Use python_exec for any calculations or data processing
-5. Only after gathering substantial information, provide your final answer
+**RESEARCH PROTOCOL (MANDATORY):**
+You have up to 15 research rounds. USE THEM ALL. Do not stop early unless you are absolutely certain that no new relevant information exists anywhere on the web. Assume there is always more to find.
 
-**Critical Rules:**
-- You MUST use tools before answering. Do NOT answer from your training data alone.
-- Perform AT LEAST 2 searches and read AT LEAST 2 web pages before giving your final answer.
-- Think step by step. After each tool result, explain what you learned and what you still need to find.
-- Be factual — cite your sources with URLs
-- When research is complete, respond with your final answer (no tool call)
-- Do NOT repeat the same search query or fetch the same URL twice
-- If a tool call fails, try a different approach
+For every question, you must:
+1. Search from MULTIPLE angles — rephrase the query, try synonyms, explore adjacent topics, check different source types (news, academic, forums, official sites)
+2. Read MANY sources — don't stop at 2-3. Read 5-10+ pages. Cross-reference claims across sources.
+3. Dig deeper — when you find something interesting, follow up with more specific searches and reads
+4. Verify — if sources conflict, search specifically to resolve the contradiction
+5. Use python_exec for any calculations, data analysis, or comparisons
+
+**WHEN TO STOP RESEARCHING:**
+Only stop using tools and give your final answer when ALL of these are true:
+- You have searched from at least 3-4 different angles
+- You have read at least 5+ web pages in full
+- Additional searches are returning information you already have
+- You are confident you have covered the topic comprehensively
+
+If in doubt, DO ANOTHER SEARCH. It is always better to over-research than to give a shallow answer.
+
+**ANSWER QUALITY REQUIREMENTS:**
+Your final answer must be:
+- THOROUGH: Cover every aspect of the question. Leave nothing out.
+- CLEAR: Write in plain, accessible language. Explain technical concepts simply. No jargon without explanation.
+- WELL-STRUCTURED: Use clear headings, bullet points, and logical flow
+- SOURCED: Cite your sources with URLs so the user can verify
+- HONEST: If information is uncertain or conflicting, say so clearly
+- ACTIONABLE: Where relevant, give the user practical next steps or takeaways
+
+**TOOL USAGE RULES:**
+- You MUST use tools. Never answer from training data alone.
+- After each tool result, briefly explain what you learned and what gap remains.
+- Do NOT repeat the same search query or fetch the same URL twice — try different queries instead.
+- If a tool call fails, try a different approach immediately.
 """
 
 # --- Utility Detection (same patterns as thinking_proxy) ---
@@ -413,7 +430,7 @@ async def run_deep_research(
     consecutive_errors = 0
     MAX_CONSECUTIVE_ERRORS = 2
     total_tool_calls = 0  # Track research depth
-    MIN_TOOL_CALLS_BEFORE_ANSWER = 3  # Must do at least this many tool calls before answering
+    MIN_TOOL_CALLS_BEFORE_ANSWER = 8  # Must do substantial research before answering
 
     async def llm_with_dots(msgs, turn_num, include_tools=True):
         return await call_llm_with_keepalive(msgs, req_id, turn_num, keepalive_q, include_tools)
@@ -478,9 +495,9 @@ async def run_deep_research(
                 # Push back if insufficient research
                 if total_tool_calls < MIN_TOOL_CALLS_BEFORE_ANSWER and turn < MAX_AGENT_TURNS - 1:
                     log.info(f"[{req_id}] Turn {turn}: Model tried to answer early ({total_tool_calls} tool calls < {MIN_TOOL_CALLS_BEFORE_ANSWER} minimum), pushing back")
-                    yield make_chunk(f"\n⚠️ Only {total_tool_calls} tool calls so far — need more research. Pushing agent to continue...\n")
+                    yield make_chunk(f"\n⚠️ Only {total_tool_calls}/{MIN_TOOL_CALLS_BEFORE_ANSWER} minimum tool calls done. Not enough research — continuing...\n")
                     agent_messages.append({"role": "assistant", "content": content})
-                    agent_messages.append({"role": "user", "content": "You haven't done enough research yet. You need to search for more information and read more sources before answering. Please use the search and fetch tools to gather more data. Do NOT answer yet."})
+                    agent_messages.append({"role": "user", "content": f"STOP. You have only done {total_tool_calls} tool calls. This is not nearly enough research. You need to search from more angles, read more pages, and dig deeper. Try different search queries, read more sources, and cross-reference. Do NOT give your final answer until you have done thorough research. Use a tool NOW."})
                     continue
 
                 log.info(f"[{req_id}] Turn {turn}: Final answer after {total_tool_calls} tool calls")
