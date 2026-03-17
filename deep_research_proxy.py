@@ -63,9 +63,9 @@ logging.root.addHandler(file_handler)
 log = logging.getLogger("deep-research")
 
 # --- Configuration ---
-UPSTREAM_BASE = os.getenv("UPSTREAM_BASE", "https://openrouter.ai/api/v1")
-UPSTREAM_KEY = os.getenv("UPSTREAM_KEY", "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")
-UPSTREAM_MODEL = os.getenv("UPSTREAM_MODEL", "mistralai/mistral-large-2512")
+UPSTREAM_BASE = os.getenv("UPSTREAM_BASE", "https://api.mistral.ai/v1")
+UPSTREAM_KEY = os.getenv("UPSTREAM_KEY", "4ecwQOWEBgZQP6sDNr5uZMM7EuAvTdXE")
+UPSTREAM_MODEL = os.getenv("UPSTREAM_MODEL", "mistral-large-latest")
 SEARXNG_URL = os.getenv("SEARXNG_URL", "http://localhost:8888")
 LISTEN_PORT = int(os.getenv("DEEP_RESEARCH_PORT", "9200"))
 MAX_AGENT_TURNS = int(os.getenv("MAX_AGENT_TURNS", "15"))
@@ -360,8 +360,6 @@ async def call_llm(messages: list[dict], req_id: str, turn: int) -> str:
                 headers={
                     "Authorization": f"Bearer {UPSTREAM_KEY}",
                     "Content-Type": "application/json",
-                    "HTTP-Referer": "https://deep-search.uk",
-                    "X-Title": "Deep Research Proxy",
                 },
             )
 
@@ -457,6 +455,8 @@ async def run_deep_research(
     used_queries = set()  # Track duplicate searches
     used_urls = set()     # Track duplicate fetches
     keepalive_q = asyncio.Queue()
+    consecutive_errors = 0  # Circuit breaker for auth/fatal errors
+    MAX_CONSECUTIVE_ERRORS = 2
 
     async def llm_with_dots(msgs, turn_num):
         """Call LLM and collect keepalive dots to yield later."""
@@ -491,11 +491,27 @@ async def run_deep_research(
 
             # Check for LLM errors
             if llm_response.startswith("[LLM Error"):
+                consecutive_errors += 1
                 yield make_chunk(f"⚠️ {llm_response}\n")
+
+                # Circuit breaker: stop after repeated fatal errors (e.g. 401 auth)
+                if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
+                    log.error(f"[{req_id}] Circuit breaker: {consecutive_errors} consecutive errors, aborting")
+                    yield make_chunk(f"\n🛑 Aborting: {consecutive_errors} consecutive LLM errors. Check API key/provider.\n")
+                    yield make_chunk("\n</think>\n\n")
+                    yield make_chunk(f"**Research failed:** The upstream LLM returned repeated errors. Please check the API key and provider configuration.\n\nLast error: {llm_response}")
+                    yield make_chunk("", finish_reason="stop")
+                    yield "data: [DONE]\n\n"
+                    active_requests.pop(req_id, None)
+                    return
+
                 # Try to continue — the model might recover
                 agent_messages.append({"role": "assistant", "content": llm_response})
                 agent_messages.append({"role": "user", "content": "There was an error with your previous response. Please try a different approach."})
                 continue
+
+            # Reset error counter on successful LLM response
+            consecutive_errors = 0
 
             # Parse for tool call
             tool_call = parse_tool_call(llm_response)
@@ -644,8 +660,7 @@ async def stream_passthrough(
                 headers={
                     "Authorization": f"Bearer {UPSTREAM_KEY}",
                     "Content-Type": "application/json",
-                    "HTTP-Referer": "https://deep-search.uk",
-                    "X-Title": "Deep Research Proxy",
+
                 },
             ) as resp:
                 if resp.status_code != 200:
