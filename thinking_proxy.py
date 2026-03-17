@@ -61,9 +61,9 @@ logging.root.addHandler(file_handler)
 log = logging.getLogger("thinking-proxy")
 
 # --- Configuration ---
-UPSTREAM_BASE = os.getenv("UPSTREAM_BASE", "https://openrouter.ai/api/v1")
-UPSTREAM_KEY = os.getenv("UPSTREAM_KEY", "")
-UPSTREAM_MODEL = os.getenv("UPSTREAM_MODEL", "mistralai/mistral-large-2512")
+UPSTREAM_BASE = os.getenv("UPSTREAM_BASE", "https://api.mistral.ai/v1")
+UPSTREAM_KEY = os.getenv("UPSTREAM_KEY", "4ecwQOWEBgZQP6sDNr5uZMM7EuAvTdXE")
+UPSTREAM_MODEL = os.getenv("UPSTREAM_MODEL", "mistral-large-latest")
 LISTEN_PORT = int(os.getenv("THINKING_PROXY_PORT", "9100"))
 
 log.info(f"Config: UPSTREAM_BASE={UPSTREAM_BASE}, UPSTREAM_MODEL={UPSTREAM_MODEL}, PORT={LISTEN_PORT}")
