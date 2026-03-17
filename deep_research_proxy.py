@@ -64,7 +64,7 @@ log = logging.getLogger("deep-research")
 
 # --- Configuration ---
 UPSTREAM_BASE = os.getenv("UPSTREAM_BASE", "https://openrouter.ai/api/v1")
-UPSTREAM_KEY = os.getenv("UPSTREAM_KEY", "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")
+UPSTREAM_KEY = os.getenv("UPSTREAM_KEY", "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")
 UPSTREAM_MODEL = os.getenv("UPSTREAM_MODEL", "mistralai/mistral-large-2512")
 SEARXNG_URL = os.getenv("SEARXNG_URL", "http://localhost:8888")
 LISTEN_PORT = int(os.getenv("DEEP_RESEARCH_PORT", "9200"))
@@ -343,13 +343,13 @@ def extract_text_before_tool_call(text: str) -> str:
 # ============================================================================
 
 async def call_llm(messages: list[dict], req_id: str, turn: int) -> str:
-    """Call the upstream LLM and return the full response text."""
+    """Call the upstream LLM (non-streaming) and return the full response text."""
     body = {
         "model": UPSTREAM_MODEL,
         "messages": messages,
         "max_tokens": 4096,
         "temperature": 0.3,
-        "stream": False,  # Non-streaming for the agent loop (faster for tool calls)
+        "stream": False,
     }
 
     try:
@@ -384,6 +384,27 @@ async def call_llm(messages: list[dict], req_id: str, turn: int) -> str:
         return "[LLM Error: Request timed out]"
     except Exception as e:
         return f"[LLM Error: {str(e)}]"
+
+
+async def call_llm_with_keepalive(
+    messages: list[dict], req_id: str, turn: int, keepalive_queue: asyncio.Queue
+) -> str:
+    """Call LLM while sending keepalive signals so the SSE stream doesn't stall.
+    Pushes a '.' to keepalive_queue every 8 seconds while waiting."""
+    result_holder = {"value": None, "done": False}
+
+    async def _do_call():
+        result_holder["value"] = await call_llm(messages, req_id, turn)
+        result_holder["done"] = True
+
+    async def _keepalive():
+        while not result_holder["done"]:
+            await asyncio.sleep(8)
+            if not result_holder["done"]:
+                await keepalive_queue.put(".")
+
+    await asyncio.gather(_do_call(), _keepalive())
+    return result_holder["value"]
 
 
 # ============================================================================
@@ -435,6 +456,21 @@ async def run_deep_research(
 
     used_queries = set()  # Track duplicate searches
     used_urls = set()     # Track duplicate fetches
+    keepalive_q = asyncio.Queue()
+
+    async def llm_with_dots(msgs, turn_num):
+        """Call LLM and collect keepalive dots to yield later."""
+        return await call_llm_with_keepalive(msgs, req_id, turn_num, keepalive_q)
+
+    def drain_keepalive():
+        """Collect all pending keepalive dots into a single string."""
+        dots = ""
+        while not keepalive_q.empty():
+            try:
+                dots += keepalive_q.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+        return dots
 
     try:
         for turn in range(1, MAX_AGENT_TURNS + 1):
@@ -444,9 +480,14 @@ async def run_deep_research(
             # Stream turn header
             yield make_chunk(f"\n**[Turn {turn}/{MAX_AGENT_TURNS}]** ")
 
-            # Call LLM
+            # Call LLM with keepalive dots
             active_requests[req_id]["current_turn"] = turn
-            llm_response = await call_llm(agent_messages, req_id, turn)
+            llm_response = await llm_with_dots(agent_messages, turn)
+
+            # Emit any accumulated keepalive dots
+            dots = drain_keepalive()
+            if dots:
+                yield make_chunk(dots)
 
             # Check for LLM errors
             if llm_response.startswith("[LLM Error"):
@@ -470,9 +511,11 @@ async def run_deep_research(
                 # Close the thinking block
                 yield make_chunk("\n</think>\n\n")
 
-                # Stream the final answer
-                # Use the full LLM response as the answer
-                yield make_chunk(llm_response)
+                # Stream the final answer in chunks to avoid large single payload
+                answer = llm_response
+                chunk_size = 200
+                for i in range(0, len(answer), chunk_size):
+                    yield make_chunk(answer[i:i + chunk_size])
 
                 yield make_chunk("", finish_reason="stop")
                 yield "data: [DONE]\n\n"
@@ -543,10 +586,15 @@ async def run_deep_research(
             "role": "user",
             "content": "You have reached the maximum number of research turns. Based on ALL the information gathered so far, provide your final comprehensive answer to the original question. Do NOT call any tools."
         })
-        final_response = await call_llm(agent_messages, req_id, MAX_AGENT_TURNS + 1)
+        final_response = await llm_with_dots(agent_messages, MAX_AGENT_TURNS + 1)
+        dots = drain_keepalive()
+        if dots:
+            yield make_chunk(dots)
 
         yield make_chunk("\n</think>\n\n")
-        yield make_chunk(final_response)
+        # Stream final answer in chunks
+        for i in range(0, len(final_response), 200):
+            yield make_chunk(final_response[i:i + 200])
         yield make_chunk("", finish_reason="stop")
         yield "data: [DONE]\n\n"
 
