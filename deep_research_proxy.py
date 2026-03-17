@@ -119,25 +119,25 @@ NATIVE_TOOLS = [
     },
 ]
 
-# --- System Prompt (no XML instructions needed — native tool calling handles it) ---
+# --- System Prompt ---
 SYSTEM_PROMPT_TEMPLATE = """You are a deep research agent. Today is: {date}
 
 Your goal is to thoroughly research the user's question using the available tools and provide a comprehensive, well-sourced answer.
 
-**Research Strategy:**
-1. Break complex questions into sub-questions
-2. Search for information using searxng_search
-3. Read promising sources using fetch_webpage
-4. Verify key claims by cross-referencing multiple sources
-5. Use python_exec for any calculations or data processing needed
-6. When you have gathered enough information, provide your final answer directly
+**MANDATORY Research Process:**
+You MUST perform substantial research before answering. Follow this process:
+1. Start by searching for the topic with searxng_search (at least 2-3 different search queries from different angles)
+2. Read the most promising sources with fetch_webpage (at least 2-3 pages)
+3. If you find conflicting information, search again to verify
+4. Use python_exec for any calculations or data processing
+5. Only after gathering substantial information, provide your final answer
 
-**Important Rules:**
-- Be thorough — search multiple angles, read multiple sources
-- Be factual — cite your sources, don't speculate
-- When your research is complete, respond with your final answer (no tool call)
-- Your final answer should be comprehensive, well-structured, and directly address the user's question
-- If you cannot find reliable information, say so honestly
+**Critical Rules:**
+- You MUST use tools before answering. Do NOT answer from your training data alone.
+- Perform AT LEAST 2 searches and read AT LEAST 2 web pages before giving your final answer.
+- Think step by step. After each tool result, explain what you learned and what you still need to find.
+- Be factual — cite your sources with URLs
+- When research is complete, respond with your final answer (no tool call)
 - Do NOT repeat the same search query or fetch the same URL twice
 - If a tool call fails, try a different approach
 """
@@ -412,6 +412,8 @@ async def run_deep_research(
     keepalive_q = asyncio.Queue()
     consecutive_errors = 0
     MAX_CONSECUTIVE_ERRORS = 2
+    total_tool_calls = 0  # Track research depth
+    MIN_TOOL_CALLS_BEFORE_ANSWER = 3  # Must do at least this many tool calls before answering
 
     async def llm_with_dots(msgs, turn_num, include_tools=True):
         return await call_llm_with_keepalive(msgs, req_id, turn_num, keepalive_q, include_tools)
@@ -467,15 +469,22 @@ async def run_deep_research(
             content = result["content"]
             tool_calls = result.get("tool_calls")
 
-            # Stream any reasoning content from the model
+            # Stream full reasoning content from the model (don't truncate — this is the thinking trace)
             if content:
-                display = content[:500] + ("..." if len(content) > 500 else "")
-                yield make_chunk(f"{display}\n")
+                yield make_chunk(f"{content}\n")
 
-            # No tool calls = final answer
+            # No tool calls = model wants to give final answer
             if not tool_calls:
-                log.info(f"[{req_id}] Turn {turn}: Final answer (no tool calls)")
-                yield make_chunk("Synthesizing final answer...\n")
+                # Push back if insufficient research
+                if total_tool_calls < MIN_TOOL_CALLS_BEFORE_ANSWER and turn < MAX_AGENT_TURNS - 1:
+                    log.info(f"[{req_id}] Turn {turn}: Model tried to answer early ({total_tool_calls} tool calls < {MIN_TOOL_CALLS_BEFORE_ANSWER} minimum), pushing back")
+                    yield make_chunk(f"\n⚠️ Only {total_tool_calls} tool calls so far — need more research. Pushing agent to continue...\n")
+                    agent_messages.append({"role": "assistant", "content": content})
+                    agent_messages.append({"role": "user", "content": "You haven't done enough research yet. You need to search for more information and read more sources before answering. Please use the search and fetch tools to gather more data. Do NOT answer yet."})
+                    continue
+
+                log.info(f"[{req_id}] Turn {turn}: Final answer after {total_tool_calls} tool calls")
+                yield make_chunk(f"\n✅ Research complete ({total_tool_calls} tool calls across {turn} turns). Generating final answer...\n")
                 yield make_chunk("\n</think>\n\n")
 
                 # Stream the final answer in chunks
@@ -531,15 +540,18 @@ async def run_deep_research(
                     yield make_chunk(f"🔧 Calling: {tool_name}\n")
 
                 # Execute tool
+                total_tool_calls += 1
                 tool_start = time.monotonic()
                 tool_result = await execute_tool(tool_name, arguments)
                 tool_duration = time.monotonic() - tool_start
 
                 log.info(f"[{req_id}] Turn {turn}: Tool {tool_name} completed in {tool_duration:.1f}s, result length: {len(tool_result)}")
 
-                # Stream brief result summary
-                result_preview = tool_result[:300].replace('\n', ' ')
-                yield make_chunk(f"→ Result ({tool_duration:.1f}s): {result_preview}{'...' if len(tool_result) > 300 else ''}\n")
+                # Stream tool result into thinking trace (show enough to be useful)
+                result_display = tool_result[:2000]
+                if len(tool_result) > 2000:
+                    result_display += f"\n[... {len(tool_result) - 2000} more chars truncated ...]" 
+                yield make_chunk(f"\n**Result** ({tool_duration:.1f}s, {len(tool_result)} chars):\n{result_display}\n")
 
                 # Feed tool result back using proper tool role message
                 agent_messages.append({
