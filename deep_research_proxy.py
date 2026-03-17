@@ -386,6 +386,41 @@ async def call_llm_with_keepalive(
 
 
 # ============================================================================
+# Thinking Trace Summarization
+# ============================================================================
+
+def _summarize_tool_result(tool_name: str, arguments: dict, result: str, duration: float) -> str:
+    """Create a concise one-line summary of a tool result for the thinking trace."""
+    if tool_name == "searxng_search":
+        # Count results and extract first few titles
+        lines = result.split("\n")
+        titles = [l.strip().lstrip("0123456789. ").strip("*") for l in lines if l.strip().startswith(("1.", "2.", "3.", "4.", "5.", "6.", "7.", "8.", "9."))]
+        n = len(titles)
+        if n == 0:
+            return f"{duration:.1f}s — no results"
+        preview = ", ".join(titles[:3])
+        if n > 3:
+            preview += f" (+{n-3} more)"
+        return f"{duration:.1f}s — {n} results: {preview}"
+
+    elif tool_name == "fetch_webpage":
+        url = arguments.get("url", "?")
+        chars = len(result)
+        if "error" in result.lower()[:50] or chars < 100:
+            return f"{duration:.1f}s — {result[:120]}"
+        return f"{duration:.1f}s — fetched {chars:,} chars from {url[:60]}"
+
+    elif tool_name == "python_exec":
+        output = result.strip()
+        if len(output) <= 150:
+            return f"{duration:.1f}s — {output}"
+        return f"{duration:.1f}s — {output[:150]}..."
+
+    else:
+        return f"{duration:.1f}s — {len(result)} chars"
+
+
+# ============================================================================
 # Agent Loop + Streaming
 # ============================================================================
 
@@ -436,8 +471,9 @@ async def run_deep_research(
     keepalive_q = asyncio.Queue()
     consecutive_errors = 0
     MAX_CONSECUTIVE_ERRORS = 2
-    total_tool_calls = 0  # Track research depth
-    MIN_TOOL_CALLS_BEFORE_ANSWER = 8  # Must do substantial research before answering
+    total_tool_calls = 0
+    turns_with_tools = 0  # Track actual research ROUNDS (not raw call count)
+    consecutive_no_tool_turns = 0  # Track how many times in a row model tried to stop
 
     async def llm_with_dots(msgs, turn_num, include_tools=True):
         return await call_llm_with_keepalive(msgs, req_id, turn_num, keepalive_q, include_tools)
@@ -493,22 +529,47 @@ async def run_deep_research(
             content = result["content"]
             tool_calls = result.get("tool_calls")
 
-            # Stream full reasoning content from the model (don't truncate — this is the thinking trace)
+            # Stream model reasoning to thinking trace — summarized, not full dump
             if content:
-                yield make_chunk(f"{content}\n")
+                # Trim verbose reasoning to keep trace readable
+                if len(content) > 500:
+                    # Show first 400 chars + last 100 chars
+                    trimmed = content[:400] + f"\n[...{len(content) - 500} chars trimmed...]\n" + content[-100:]
+                    yield make_chunk(f"{trimmed}\n")
+                else:
+                    yield make_chunk(f"{content}\n")
 
             # No tool calls = model wants to give final answer
             if not tool_calls:
-                # Push back if insufficient research
-                if total_tool_calls < MIN_TOOL_CALLS_BEFORE_ANSWER and turn < MAX_AGENT_TURNS - 1:
-                    log.info(f"[{req_id}] Turn {turn}: Model tried to answer early ({total_tool_calls} tool calls < {MIN_TOOL_CALLS_BEFORE_ANSWER} minimum), pushing back")
-                    yield make_chunk(f"\n⚠️ Only {total_tool_calls}/{MIN_TOOL_CALLS_BEFORE_ANSWER} minimum tool calls done. Not enough research — continuing...\n")
+                consecutive_no_tool_turns += 1
+
+                # ALWAYS push the model to keep researching unless:
+                #  1. It's on the last 2 turns (leave room for forced final answer)
+                #  2. It has insisted on stopping 3 times in a row (genuinely done)
+                #  3. It has done 10+ research rounds (extensive research)
+                can_stop = (
+                    turn >= MAX_AGENT_TURNS - 1  # last 2 turns
+                    or consecutive_no_tool_turns >= 3  # insisted 3x
+                    or turns_with_tools >= 10  # very thorough already
+                )
+
+                if not can_stop:
+                    log.info(f"[{req_id}] Turn {turn}: Pushing model to continue ({turns_with_tools} research rounds, {total_tool_calls} calls, attempt {consecutive_no_tool_turns})")
+                    yield make_chunk(f"\n↻ {turns_with_tools} research rounds done — pushing deeper...\n")
                     agent_messages.append({"role": "assistant", "content": content})
-                    agent_messages.append({"role": "user", "content": f"STOP. You have only done {total_tool_calls} tool calls. This is not nearly enough research. You need to search from more angles, read more pages, and dig deeper. Try different search queries, read more sources, and cross-reference. Do NOT give your final answer until you have done thorough research. Use a tool NOW."})
+
+                    # Vary the push-back message to get different angles
+                    pushbacks = [
+                        "You are NOT done researching. You have barely scratched the surface. Search for different angles, alternative viewpoints, recent developments, expert opinions, and primary sources. Read actual web pages, don't just rely on search snippets. Use a tool NOW.",
+                        "Your research is still incomplete. Think about what perspectives you HAVEN'T covered yet. Are there contrarian views? Historical context? Regional differences? Technical details you glossed over? Quantitative data? Search for something you haven't explored yet. Use a tool NOW.",
+                        "Keep going. Look for: original research papers, official reports, expert interviews, forum discussions with practitioners, comparison data, timeline of developments, predictions from credible sources. You have many turns left — USE THEM. Call a tool NOW.",
+                    ]
+                    push_msg = pushbacks[(consecutive_no_tool_turns - 1) % len(pushbacks)]
+                    agent_messages.append({"role": "user", "content": push_msg})
                     continue
 
-                log.info(f"[{req_id}] Turn {turn}: Final answer after {total_tool_calls} tool calls")
-                yield make_chunk(f"\n✅ Research complete ({total_tool_calls} tool calls across {turn} turns). Generating final answer...\n")
+                log.info(f"[{req_id}] Turn {turn}: Final answer after {turns_with_tools} research rounds ({total_tool_calls} tool calls)")
+                yield make_chunk(f"\n✅ Research complete ({turns_with_tools} rounds, {total_tool_calls} tool calls). Generating answer...\n")
                 yield make_chunk("\n</think>\n\n")
 
                 # Stream the final answer in chunks
@@ -522,6 +583,8 @@ async def run_deep_research(
                 return
 
             # Process tool calls (Mistral can return multiple, we handle all)
+            turns_with_tools += 1  # This turn used tools — counts as a research round
+            consecutive_no_tool_turns = 0  # Reset — model is still researching
             # Build the assistant message with tool_calls for the message history
             assistant_msg = {"role": "assistant", "content": content or None, "tool_calls": tool_calls}
             agent_messages.append(assistant_msg)
@@ -571,13 +634,11 @@ async def run_deep_research(
 
                 log.info(f"[{req_id}] Turn {turn}: Tool {tool_name} completed in {tool_duration:.1f}s, result length: {len(tool_result)}")
 
-                # Stream tool result into thinking trace (show enough to be useful)
-                result_display = tool_result[:2000]
-                if len(tool_result) > 2000:
-                    result_display += f"\n[... {len(tool_result) - 2000} more chars truncated ...]" 
-                yield make_chunk(f"\n**Result** ({tool_duration:.1f}s, {len(tool_result)} chars):\n{result_display}\n")
+                # Stream CONCISE summary to thinking trace (not raw content)
+                summary = _summarize_tool_result(tool_name, arguments, tool_result, tool_duration)
+                yield make_chunk(f"  → {summary}\n")
 
-                # Feed tool result back using proper tool role message
+                # Feed FULL tool result back to the LLM (it needs the data)
                 agent_messages.append({
                     "role": "tool",
                     "tool_call_id": tc_id,
