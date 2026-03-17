@@ -315,8 +315,13 @@ async def execute_tool(tool_name: str, arguments: dict) -> str:
 # LLM Communication (Native Function Calling)
 # ============================================================================
 
+RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
+MAX_LLM_RETRIES = 3
+RETRY_BACKOFF = [5, 15, 30]  # seconds between retries
+
+
 async def call_llm(messages: list[dict], req_id: str, turn: int, include_tools: bool = True) -> dict:
-    """Call the upstream LLM with native function calling. Returns the full message dict."""
+    """Call the upstream LLM with native function calling. Retries on transient errors."""
     body = {
         "model": UPSTREAM_MODEL,
         "messages": messages,
@@ -328,41 +333,61 @@ async def call_llm(messages: list[dict], req_id: str, turn: int, include_tools: 
         body["tools"] = NATIVE_TOOLS
         body["tool_choice"] = "auto"
 
-    try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=30.0)) as client:
-            resp = await client.post(
-                f"{UPSTREAM_BASE}/chat/completions",
-                json=body,
-                headers={
-                    "Authorization": f"Bearer {UPSTREAM_KEY}",
-                    "Content-Type": "application/json",
-                },
-            )
+    last_error = None
+    for attempt in range(MAX_LLM_RETRIES + 1):
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=30.0)) as client:
+                resp = await client.post(
+                    f"{UPSTREAM_BASE}/chat/completions",
+                    json=body,
+                    headers={
+                        "Authorization": f"Bearer {UPSTREAM_KEY}",
+                        "Content-Type": "application/json",
+                    },
+                )
 
-            if resp.status_code != 200:
-                error_text = resp.text[:500]
-                log.error(f"[{req_id}] Turn {turn}: LLM error {resp.status_code}: {error_text}")
-                return {"error": f"[LLM Error: HTTP {resp.status_code}] {error_text}"}
+                if resp.status_code != 200:
+                    error_text = resp.text[:500]
+                    last_error = f"[LLM Error: HTTP {resp.status_code}] {error_text}"
 
-            data = resp.json()
-            choices = data.get("choices", [])
-            if not choices:
-                return {"error": "[LLM Error: No choices in response]"}
+                    # Retry on transient errors
+                    if resp.status_code in RETRYABLE_STATUS_CODES and attempt < MAX_LLM_RETRIES:
+                        wait = RETRY_BACKOFF[attempt]
+                        log.warning(f"[{req_id}] Turn {turn}: Retryable error {resp.status_code}, waiting {wait}s (attempt {attempt + 1}/{MAX_LLM_RETRIES})")
+                        await asyncio.sleep(wait)
+                        continue
 
-            message = choices[0].get("message", {})
-            finish_reason = choices[0].get("finish_reason", "")
+                    log.error(f"[{req_id}] Turn {turn}: LLM error {resp.status_code} (final): {error_text}")
+                    return {"error": last_error}
 
-            return {
-                "message": message,
-                "content": message.get("content", "") or "",
-                "tool_calls": message.get("tool_calls", None),
-                "finish_reason": finish_reason,
-            }
+                data = resp.json()
+                choices = data.get("choices", [])
+                if not choices:
+                    return {"error": "[LLM Error: No choices in response]"}
 
-    except httpx.ReadTimeout:
-        return {"error": "[LLM Error: Request timed out]"}
-    except Exception as e:
-        return {"error": f"[LLM Error: {str(e)}]"}
+                message = choices[0].get("message", {})
+                finish_reason = choices[0].get("finish_reason", "")
+
+                return {
+                    "message": message,
+                    "content": message.get("content", "") or "",
+                    "tool_calls": message.get("tool_calls", None),
+                    "finish_reason": finish_reason,
+                }
+
+        except (httpx.ReadTimeout, httpx.ConnectTimeout) as e:
+            last_error = f"[LLM Error: {type(e).__name__}]"
+            if attempt < MAX_LLM_RETRIES:
+                wait = RETRY_BACKOFF[attempt]
+                log.warning(f"[{req_id}] Turn {turn}: Timeout, retrying in {wait}s (attempt {attempt + 1}/{MAX_LLM_RETRIES})")
+                await asyncio.sleep(wait)
+                continue
+            return {"error": last_error}
+
+        except Exception as e:
+            return {"error": f"[LLM Error: {str(e)}]"}
+
+    return {"error": last_error or "[LLM Error: Max retries exceeded]"}
 
 
 async def call_llm_with_keepalive(
@@ -470,7 +495,7 @@ async def run_deep_research(
     used_queries = set()
     keepalive_q = asyncio.Queue()
     consecutive_errors = 0
-    MAX_CONSECUTIVE_ERRORS = 2
+    MAX_CONSECUTIVE_ERRORS = 3  # After retries exhausted, 3 consecutive turn failures = abort
     total_tool_calls = 0
     turns_with_tools = 0  # Track actual research ROUNDS (not raw call count)
     consecutive_no_tool_turns = 0  # Track how many times in a row model tried to stop
@@ -511,9 +536,12 @@ async def run_deep_research(
 
                 if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
                     log.error(f"[{req_id}] Circuit breaker: {consecutive_errors} consecutive errors, aborting")
-                    yield make_chunk(f"\n🛑 Aborting: {consecutive_errors} consecutive LLM errors.\n")
+                    yield make_chunk(f"\n🛑 Aborting after {consecutive_errors} consecutive failures (each retried {MAX_LLM_RETRIES}x).\n")
                     yield make_chunk("\n</think>\n\n")
-                    yield make_chunk(f"**Research failed:** The upstream LLM returned repeated errors.\n\nLast error: {result['error']}")
+                    yield make_chunk(f"**Research failed — upstream LLM is unavailable.**\n\n")
+                    yield make_chunk(f"**Error:** `{result['error']}`\n\n")
+                    yield make_chunk(f"This means the Mistral API returned errors on {consecutive_errors} consecutive turns, with {MAX_LLM_RETRIES} retries each ({consecutive_errors * (MAX_LLM_RETRIES + 1)} total attempts). ")
+                    yield make_chunk(f"The API may be overloaded or experiencing an outage. Try again in a few minutes.")
                     yield make_chunk("", finish_reason="stop")
                     yield "data: [DONE]\n\n"
                     active_requests.pop(req_id, None)
