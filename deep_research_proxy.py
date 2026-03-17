@@ -1,23 +1,20 @@
 #!/usr/bin/env python3
 """
-Deep Research Proxy for Open WebUI.
+Deep Research Proxy (MiroFlow) for Open WebUI.
 
 An OpenAI-compatible proxy that implements a MiroFlow-inspired agentic deep research
-loop. When a user asks a question, the proxy orchestrates multi-turn reasoning with
-tool use (SearXNG search, web page reading, Python execution) and streams the entire
-research process as <think> tags to Open WebUI, followed by a polished final answer.
+loop using Mistral's native function calling. When a user asks a question, the proxy
+orchestrates multi-turn reasoning with tool use (SearXNG search, web page reading,
+Python execution) and streams the entire research process as <think> tags to Open WebUI,
+followed by a polished final answer.
 
 Architecture:
   - Receives OpenAI-compatible chat/completions requests from Open WebUI
-  - Runs a multi-turn agent loop: LLM thinks → calls tools via XML → results fed back
+  - Sends requests to Mistral API with native `tools` parameter
+  - Parses tool_calls from the response, executes tools, feeds results back
   - All reasoning and tool interactions streamed as <think> content
   - Final answer streamed as main content after </think>
   - Utility requests (title/tag generation) bypass the agent loop
-
-Tools (all self-hosted, no external APIs):
-  - searxng_search: Search via local SearXNG instance
-  - fetch_webpage: Fetch and extract readable text from URLs
-  - python_exec: Execute Python code in a sandboxed subprocess
 """
 
 import asyncio
@@ -73,59 +70,59 @@ WEBPAGE_MAX_CHARS = 15000
 PYTHON_TIMEOUT = 30
 PYTHON_OUTPUT_MAX = 5000
 
-log.info(f"Config: model={UPSTREAM_MODEL}, searxng={SEARXNG_URL}, port={LISTEN_PORT}, max_turns={MAX_AGENT_TURNS}")
+log.info(f"Config: model={UPSTREAM_MODEL}, upstream={UPSTREAM_BASE}, searxng={SEARXNG_URL}, port={LISTEN_PORT}, max_turns={MAX_AGENT_TURNS}")
 
-# --- Tool Definitions ---
-TOOL_DEFINITIONS = """
-## Server name: deep-research-tools
+# --- Native Tool Definitions (OpenAI function-calling format) ---
+NATIVE_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "searxng_search",
+            "description": "Search the web using SearXNG. Returns top results with titles, URLs, and snippets. Use this to find information, verify facts, discover sources.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "The search query"}
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "fetch_webpage",
+            "description": "Fetch a webpage and extract its readable text content. Use this to read articles, documentation, or any web page found via search.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string", "description": "The URL to fetch"},
+                    "extract_info": {"type": "string", "description": "Optional: specific information to look for in the page"},
+                },
+                "required": ["url"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "python_exec",
+            "description": "Execute Python code for calculations, data processing, or analysis. Code runs in a sandboxed subprocess with a 30-second timeout.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "code": {"type": "string", "description": "Python code to execute. Use print() to output results."}
+                },
+                "required": ["code"],
+            },
+        },
+    },
+]
 
-### Tool name: searxng_search
-Description: Search the web using SearXNG. Returns top results with titles, URLs, and snippets. Use this to find information, verify facts, discover sources.
-Input JSON schema: {"type": "object", "properties": {"query": {"type": "string", "description": "The search query"}}, "required": ["query"]}
+# --- System Prompt (no XML instructions needed — native tool calling handles it) ---
+SYSTEM_PROMPT_TEMPLATE = """You are a deep research agent. Today is: {date}
 
-### Tool name: fetch_webpage
-Description: Fetch a webpage and extract its readable text content. Use this to read articles, documentation, or any web page found via search. Returns the main text content, truncated to ~15000 characters.
-Input JSON schema: {"type": "object", "properties": {"url": {"type": "string", "description": "The URL to fetch"}, "extract_info": {"type": "string", "description": "Optional: specific information to look for in the page"}}, "required": ["url"]}
-
-### Tool name: python_exec
-Description: Execute Python code for calculations, data processing, or analysis. Code runs in a sandboxed subprocess with a 30-second timeout. Use for math, date calculations, data manipulation, etc.
-Input JSON schema: {"type": "object", "properties": {"code": {"type": "string", "description": "Python code to execute. Use print() to output results."}}, "required": ["code"]}
-"""
-
-# --- System Prompt ---
-SYSTEM_PROMPT_TEMPLATE = """In this environment you have access to a set of tools you can use to answer the user's question.
-
-You only have access to the tools provided below. You can only use one tool per message, and will receive the result of that tool in the user's next response. You use tools step-by-step to accomplish a given task, with each tool-use informed by the result of the previous tool-use. Today is: {date}
-
-# Tool-Use Formatting Instructions
-
-Tool-use is formatted using XML-style tags. The tool-use is enclosed in <use_mcp_tool></use_mcp_tool> and each parameter is similarly enclosed within its own set of tags.
-
-Parameters:
-- server_name: (required) The name of the MCP server providing the tool
-- tool_name: (required) The name of the tool to execute
-- arguments: (required) A JSON object containing the tool's input parameters
-
-Usage:
-<use_mcp_tool>
-<server_name>deep-research-tools</server_name>
-<tool_name>tool name here</tool_name>
-<arguments>
-{{"param1": "value1"}}
-</arguments>
-</use_mcp_tool>
-
-Important Notes:
-- Tool-use must be placed **at the end** of your response, **top-level**, and not nested within other tags.
-- Always adhere to this format for the tool use to ensure proper parsing and execution.
-- You can only call ONE tool per message.
-
-Here are the tools available:
-{tools}
-
-# Your Objective
-
-You are a deep research agent. Your goal is to thoroughly research the user's question using the available tools and provide a comprehensive, well-sourced answer.
+Your goal is to thoroughly research the user's question using the available tools and provide a comprehensive, well-sourced answer.
 
 **Research Strategy:**
 1. Break complex questions into sub-questions
@@ -133,12 +130,12 @@ You are a deep research agent. Your goal is to thoroughly research the user's qu
 3. Read promising sources using fetch_webpage
 4. Verify key claims by cross-referencing multiple sources
 5. Use python_exec for any calculations or data processing needed
-6. When you have gathered enough information, provide your final answer WITHOUT any tool call
+6. When you have gathered enough information, provide your final answer directly
 
 **Important Rules:**
 - Be thorough — search multiple angles, read multiple sources
 - Be factual — cite your sources, don't speculate
-- When your research is complete, write your final answer directly (no tool call)
+- When your research is complete, respond with your final answer (no tool call)
 - Your final answer should be comprehensive, well-structured, and directly address the user's question
 - If you cannot find reliable information, say so honestly
 - Do NOT repeat the same search query or fetch the same URL twice
@@ -156,7 +153,7 @@ UTILITY_PATTERNS = [
     "autocomplete",
 ]
 
-app = FastAPI(title="Deep Research Proxy")
+app = FastAPI(title="Deep Research Proxy (MiroFlow)")
 active_requests: dict[str, dict] = {}
 
 
@@ -225,16 +222,11 @@ async def tool_fetch_webpage(url: str, extract_info: str = "") -> str:
             raw_html = resp.text
 
             # Simple but effective HTML to text extraction
-            # Remove script and style blocks
             text = re.sub(r'<script[^>]*>.*?</script>', '', raw_html, flags=re.DOTALL | re.IGNORECASE)
             text = re.sub(r'<style[^>]*>.*?</style>', '', raw_html, flags=re.DOTALL | re.IGNORECASE)
-            # Remove HTML tags
             text = re.sub(r'<[^>]+>', ' ', text)
-            # Decode HTML entities
             text = html.unescape(text)
-            # Normalize whitespace
             text = re.sub(r'\s+', ' ', text).strip()
-            # Collapse multiple newlines
             text = re.sub(r'\n{3,}', '\n\n', text)
 
             if len(text) > WEBPAGE_MAX_CHARS:
@@ -296,54 +288,11 @@ async def execute_tool(tool_name: str, arguments: dict) -> str:
 
 
 # ============================================================================
-# MCP XML Parsing
+# LLM Communication (Native Function Calling)
 # ============================================================================
 
-def parse_tool_call(text: str) -> Optional[dict]:
-    """Parse a <use_mcp_tool> XML block from the LLM response."""
-    match = re.search(
-        r'<use_mcp_tool>\s*'
-        r'<server_name>(.*?)</server_name>\s*'
-        r'<tool_name>(.*?)</tool_name>\s*'
-        r'<arguments>\s*(.*?)\s*</arguments>\s*'
-        r'</use_mcp_tool>',
-        text,
-        re.DOTALL,
-    )
-    if not match:
-        return None
-
-    server_name = match.group(1).strip()
-    tool_name = match.group(2).strip()
-    arguments_str = match.group(3).strip()
-
-    try:
-        arguments = json.loads(arguments_str)
-    except json.JSONDecodeError:
-        # Try to fix common JSON issues
-        try:
-            # Sometimes the LLM uses single quotes
-            arguments = json.loads(arguments_str.replace("'", '"'))
-        except json.JSONDecodeError:
-            return {"server_name": server_name, "tool_name": tool_name, "arguments": {}, "raw_args": arguments_str, "parse_error": True}
-
-    return {"server_name": server_name, "tool_name": tool_name, "arguments": arguments}
-
-
-def extract_text_before_tool_call(text: str) -> str:
-    """Extract the reasoning text before any <use_mcp_tool> block."""
-    match = re.search(r'<use_mcp_tool>', text)
-    if match:
-        return text[:match.start()].strip()
-    return text.strip()
-
-
-# ============================================================================
-# LLM Communication
-# ============================================================================
-
-async def call_llm(messages: list[dict], req_id: str, turn: int) -> str:
-    """Call the upstream LLM (non-streaming) and return the full response text."""
+async def call_llm(messages: list[dict], req_id: str, turn: int, include_tools: bool = True) -> dict:
+    """Call the upstream LLM with native function calling. Returns the full message dict."""
     body = {
         "model": UPSTREAM_MODEL,
         "messages": messages,
@@ -351,6 +300,9 @@ async def call_llm(messages: list[dict], req_id: str, turn: int) -> str:
         "temperature": 0.3,
         "stream": False,
     }
+    if include_tools:
+        body["tools"] = NATIVE_TOOLS
+        body["tool_choice"] = "auto"
 
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=30.0)) as client:
@@ -366,33 +318,37 @@ async def call_llm(messages: list[dict], req_id: str, turn: int) -> str:
             if resp.status_code != 200:
                 error_text = resp.text[:500]
                 log.error(f"[{req_id}] Turn {turn}: LLM error {resp.status_code}: {error_text}")
-                return f"[LLM Error: HTTP {resp.status_code}] {error_text}"
+                return {"error": f"[LLM Error: HTTP {resp.status_code}] {error_text}"}
 
             data = resp.json()
             choices = data.get("choices", [])
             if not choices:
-                return "[LLM Error: No choices in response]"
+                return {"error": "[LLM Error: No choices in response]"}
 
-            content = choices[0].get("message", {}).get("content", "")
-            # Strip <think> tags if the model uses them natively (Qwen3 does)
-            content = re.sub(r'<think>.*?</think>\s*', '', content, flags=re.DOTALL)
-            return content
+            message = choices[0].get("message", {})
+            finish_reason = choices[0].get("finish_reason", "")
+
+            return {
+                "message": message,
+                "content": message.get("content", "") or "",
+                "tool_calls": message.get("tool_calls", None),
+                "finish_reason": finish_reason,
+            }
 
     except httpx.ReadTimeout:
-        return "[LLM Error: Request timed out]"
+        return {"error": "[LLM Error: Request timed out]"}
     except Exception as e:
-        return f"[LLM Error: {str(e)}]"
+        return {"error": f"[LLM Error: {str(e)}]"}
 
 
 async def call_llm_with_keepalive(
-    messages: list[dict], req_id: str, turn: int, keepalive_queue: asyncio.Queue
-) -> str:
-    """Call LLM while sending keepalive signals so the SSE stream doesn't stall.
-    Pushes a '.' to keepalive_queue every 8 seconds while waiting."""
+    messages: list[dict], req_id: str, turn: int, keepalive_queue: asyncio.Queue, include_tools: bool = True
+) -> dict:
+    """Call LLM while sending keepalive signals so the SSE stream doesn't stall."""
     result_holder = {"value": None, "done": False}
 
     async def _do_call():
-        result_holder["value"] = await call_llm(messages, req_id, turn)
+        result_holder["value"] = await call_llm(messages, req_id, turn, include_tools)
         result_holder["done"] = True
 
     async def _keepalive():
@@ -416,9 +372,10 @@ async def run_deep_research(
 ) -> AsyncGenerator[str, None]:
     """
     Run the deep research agent loop and stream results as SSE.
+    Uses native function calling — no XML parsing needed.
     All agent reasoning goes inside <think>, final answer comes after </think>.
     """
-    model_id = original_body.get("model", "deep-research")
+    model_id = original_body.get("model", "miroflow")
     request_id = f"chatcmpl-dr-{uuid.uuid4().hex[:12]}"
     created = int(time.time())
     start_time = time.monotonic()
@@ -436,13 +393,12 @@ async def run_deep_research(
         }
         return f"data: {json.dumps(data)}\n\n"
 
-    # Build system prompt with today's date and tools
+    # Build system prompt
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    system_prompt = SYSTEM_PROMPT_TEMPLATE.format(date=today, tools=TOOL_DEFINITIONS)
+    system_prompt = SYSTEM_PROMPT_TEMPLATE.format(date=today)
 
     # Build message history for the agent
     agent_messages = [{"role": "system", "content": system_prompt}]
-    # Add user messages (skip any system messages from Open WebUI)
     for msg in user_messages:
         if msg.get("role") != "system":
             agent_messages.append(msg)
@@ -452,18 +408,15 @@ async def run_deep_research(
     # Open the thinking block
     yield make_chunk("<think>\n")
 
-    used_queries = set()  # Track duplicate searches
-    used_urls = set()     # Track duplicate fetches
+    used_queries = set()
     keepalive_q = asyncio.Queue()
-    consecutive_errors = 0  # Circuit breaker for auth/fatal errors
+    consecutive_errors = 0
     MAX_CONSECUTIVE_ERRORS = 2
 
-    async def llm_with_dots(msgs, turn_num):
-        """Call LLM and collect keepalive dots to yield later."""
-        return await call_llm_with_keepalive(msgs, req_id, turn_num, keepalive_q)
+    async def llm_with_dots(msgs, turn_num, include_tools=True):
+        return await call_llm_with_keepalive(msgs, req_id, turn_num, keepalive_q, include_tools)
 
     def drain_keepalive():
-        """Collect all pending keepalive dots into a single string."""
         dots = ""
         while not keepalive_q.empty():
             try:
@@ -480,137 +433,138 @@ async def run_deep_research(
             # Stream turn header
             yield make_chunk(f"\n**[Turn {turn}/{MAX_AGENT_TURNS}]** ")
 
-            # Call LLM with keepalive dots
+            # Call LLM with native tools
             active_requests[req_id]["current_turn"] = turn
-            llm_response = await llm_with_dots(agent_messages, turn)
+            result = await llm_with_dots(agent_messages, turn)
 
-            # Emit any accumulated keepalive dots
+            # Emit keepalive dots
             dots = drain_keepalive()
             if dots:
                 yield make_chunk(dots)
 
-            # Check for LLM errors
-            if llm_response.startswith("[LLM Error"):
+            # Check for errors
+            if "error" in result:
                 consecutive_errors += 1
-                yield make_chunk(f"⚠️ {llm_response}\n")
+                yield make_chunk(f"⚠️ {result['error']}\n")
 
-                # Circuit breaker: stop after repeated fatal errors (e.g. 401 auth)
                 if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
                     log.error(f"[{req_id}] Circuit breaker: {consecutive_errors} consecutive errors, aborting")
-                    yield make_chunk(f"\n🛑 Aborting: {consecutive_errors} consecutive LLM errors. Check API key/provider.\n")
+                    yield make_chunk(f"\n🛑 Aborting: {consecutive_errors} consecutive LLM errors.\n")
                     yield make_chunk("\n</think>\n\n")
-                    yield make_chunk(f"**Research failed:** The upstream LLM returned repeated errors. Please check the API key and provider configuration.\n\nLast error: {llm_response}")
+                    yield make_chunk(f"**Research failed:** The upstream LLM returned repeated errors.\n\nLast error: {result['error']}")
                     yield make_chunk("", finish_reason="stop")
                     yield "data: [DONE]\n\n"
                     active_requests.pop(req_id, None)
                     return
 
-                # Try to continue — the model might recover
-                agent_messages.append({"role": "assistant", "content": llm_response})
-                agent_messages.append({"role": "user", "content": "There was an error with your previous response. Please try a different approach."})
+                agent_messages.append({"role": "assistant", "content": result["error"]})
+                agent_messages.append({"role": "user", "content": "There was an error. Please try a different approach."})
                 continue
 
-            # Reset error counter on successful LLM response
+            # Reset error counter
             consecutive_errors = 0
 
-            # Parse for tool call
-            tool_call = parse_tool_call(llm_response)
-            reasoning = extract_text_before_tool_call(llm_response)
+            content = result["content"]
+            tool_calls = result.get("tool_calls")
 
-            if tool_call is None:
-                # No tool call — this is the final answer
-                log.info(f"[{req_id}] Turn {turn}: Final answer (no tool call)")
-                # Stream the reasoning inside think block
-                if reasoning:
-                    yield make_chunk(f"Synthesizing final answer...\n")
+            # Stream any reasoning content from the model
+            if content:
+                display = content[:500] + ("..." if len(content) > 500 else "")
+                yield make_chunk(f"{display}\n")
 
-                # Close the thinking block
+            # No tool calls = final answer
+            if not tool_calls:
+                log.info(f"[{req_id}] Turn {turn}: Final answer (no tool calls)")
+                yield make_chunk("Synthesizing final answer...\n")
                 yield make_chunk("\n</think>\n\n")
 
-                # Stream the final answer in chunks to avoid large single payload
-                answer = llm_response
-                chunk_size = 200
-                for i in range(0, len(answer), chunk_size):
-                    yield make_chunk(answer[i:i + chunk_size])
+                # Stream the final answer in chunks
+                answer = content if content else "(No answer generated)"
+                for i in range(0, len(answer), 200):
+                    yield make_chunk(answer[i:i + 200])
 
                 yield make_chunk("", finish_reason="stop")
                 yield "data: [DONE]\n\n"
                 active_requests.pop(req_id, None)
                 return
 
-            # We have a tool call
-            tool_name = tool_call["tool_name"]
-            arguments = tool_call.get("arguments", {})
+            # Process tool calls (Mistral can return multiple, we handle all)
+            # Build the assistant message with tool_calls for the message history
+            assistant_msg = {"role": "assistant", "content": content or None, "tool_calls": tool_calls}
+            agent_messages.append(assistant_msg)
 
-            # Stream reasoning
-            if reasoning:
-                # Truncate for the think stream (don't flood the UI)
-                display_reasoning = reasoning[:500] + ("..." if len(reasoning) > 500 else "")
-                yield make_chunk(f"{display_reasoning}\n\n")
+            for tc in tool_calls:
+                tc_id = tc.get("id", f"call_{uuid.uuid4().hex[:8]}")
+                func = tc.get("function", {})
+                tool_name = func.get("name", "unknown")
+                arguments_str = func.get("arguments", "{}")
 
-            # Check for duplicates
-            query_key = f"{tool_name}:{json.dumps(arguments, sort_keys=True)}"
-            if query_key in used_queries:
-                log.warning(f"[{req_id}] Turn {turn}: Duplicate tool call: {tool_name}")
-                yield make_chunk(f"⚠️ Skipping duplicate {tool_name} call. Moving to answer...\n")
-                # Force the model to give a final answer
-                agent_messages.append({"role": "assistant", "content": llm_response})
-                agent_messages.append({"role": "user", "content": "You have already made this exact tool call. Please provide your final answer now based on the information already gathered. Do NOT make any more tool calls."})
-                continue
+                # Parse arguments
+                try:
+                    arguments = json.loads(arguments_str) if isinstance(arguments_str, str) else arguments_str
+                except json.JSONDecodeError:
+                    arguments = {}
 
-            used_queries.add(query_key)
+                # Duplicate check
+                query_key = f"{tool_name}:{json.dumps(arguments, sort_keys=True)}"
+                if query_key in used_queries:
+                    log.warning(f"[{req_id}] Turn {turn}: Duplicate tool call: {tool_name}")
+                    yield make_chunk(f"⚠️ Skipping duplicate {tool_name} call.\n")
+                    agent_messages.append({
+                        "role": "tool",
+                        "tool_call_id": tc_id,
+                        "content": "Duplicate call skipped. Please use previously gathered information or try a different query.",
+                    })
+                    continue
 
-            # Stream tool call info
-            if tool_name == "searxng_search":
-                yield make_chunk(f"🔍 Searching: `{arguments.get('query', '')}`\n")
-            elif tool_name == "fetch_webpage":
-                yield make_chunk(f"📄 Reading: `{arguments.get('url', '')[:80]}`\n")
-            elif tool_name == "python_exec":
-                code_preview = arguments.get('code', '')[:100].replace('\n', ' ')
-                yield make_chunk(f"🐍 Running code: `{code_preview}`\n")
-            else:
-                yield make_chunk(f"🔧 Calling: {tool_name}\n")
+                used_queries.add(query_key)
 
-            # Check for parse errors
-            if tool_call.get("parse_error"):
-                yield make_chunk(f"⚠️ Could not parse tool arguments\n")
-                agent_messages.append({"role": "assistant", "content": llm_response})
-                agent_messages.append({"role": "user", "content": f"Your tool call had invalid JSON arguments. The raw arguments were: {tool_call.get('raw_args', '')}. Please fix the JSON and try again, or provide your answer."})
-                continue
+                # Stream tool call info
+                if tool_name == "searxng_search":
+                    yield make_chunk(f"🔍 Searching: `{arguments.get('query', '')}`\n")
+                elif tool_name == "fetch_webpage":
+                    yield make_chunk(f"📄 Reading: `{arguments.get('url', '')[:80]}`\n")
+                elif tool_name == "python_exec":
+                    code_preview = arguments.get('code', '')[:100].replace('\n', ' ')
+                    yield make_chunk(f"🐍 Running code: `{code_preview}`\n")
+                else:
+                    yield make_chunk(f"🔧 Calling: {tool_name}\n")
 
-            # Execute tool
-            tool_start = time.monotonic()
-            tool_result = await execute_tool(tool_name, arguments)
-            tool_duration = time.monotonic() - tool_start
+                # Execute tool
+                tool_start = time.monotonic()
+                tool_result = await execute_tool(tool_name, arguments)
+                tool_duration = time.monotonic() - tool_start
 
-            log.info(f"[{req_id}] Turn {turn}: Tool {tool_name} completed in {tool_duration:.1f}s, result length: {len(tool_result)}")
+                log.info(f"[{req_id}] Turn {turn}: Tool {tool_name} completed in {tool_duration:.1f}s, result length: {len(tool_result)}")
 
-            # Stream brief result summary
-            result_preview = tool_result[:300].replace('\n', ' ')
-            yield make_chunk(f"→ Result ({tool_duration:.1f}s): {result_preview}{'...' if len(tool_result) > 300 else ''}\n")
+                # Stream brief result summary
+                result_preview = tool_result[:300].replace('\n', ' ')
+                yield make_chunk(f"→ Result ({tool_duration:.1f}s): {result_preview}{'...' if len(tool_result) > 300 else ''}\n")
 
-            # Feed result back to agent
-            agent_messages.append({"role": "assistant", "content": llm_response})
-            agent_messages.append({"role": "user", "content": f"Tool result for {tool_name}:\n\n{tool_result}"})
+                # Feed tool result back using proper tool role message
+                agent_messages.append({
+                    "role": "tool",
+                    "tool_call_id": tc_id,
+                    "content": tool_result,
+                })
 
-        # Max turns reached — force answer
+        # Max turns reached — force answer without tools
         log.info(f"[{req_id}] Max turns ({MAX_AGENT_TURNS}) reached, forcing final answer")
-        yield make_chunk(f"\n⏰ Max research turns reached. Generating answer from gathered information...\n")
+        yield make_chunk(f"\n⏰ Max research turns reached. Generating answer...\n")
 
-        # Ask model for final summary
         agent_messages.append({
             "role": "user",
-            "content": "You have reached the maximum number of research turns. Based on ALL the information gathered so far, provide your final comprehensive answer to the original question. Do NOT call any tools."
+            "content": "You have reached the maximum number of research turns. Based on ALL the information gathered so far, provide your final comprehensive answer. Do NOT call any tools."
         })
-        final_response = await llm_with_dots(agent_messages, MAX_AGENT_TURNS + 1)
+        final_result = await llm_with_dots(agent_messages, MAX_AGENT_TURNS + 1, include_tools=False)
         dots = drain_keepalive()
         if dots:
             yield make_chunk(dots)
 
         yield make_chunk("\n</think>\n\n")
-        # Stream final answer in chunks
-        for i in range(0, len(final_response), 200):
-            yield make_chunk(final_response[i:i + 200])
+        final_answer = final_result.get("content", "") if "error" not in final_result else final_result["error"]
+        for i in range(0, len(final_answer), 200):
+            yield make_chunk(final_answer[i:i + 200])
         yield make_chunk("", finish_reason="stop")
         yield "data: [DONE]\n\n"
 
@@ -637,8 +591,8 @@ async def stream_passthrough(
     original_body: dict,
     req_id: str,
 ) -> AsyncGenerator[str, None]:
-    """Pass utility requests straight through to OpenRouter without the agent loop."""
-    model_id = original_body.get("model", "deep-research")
+    """Pass utility requests straight through to the upstream LLM without the agent loop."""
+    model_id = original_body.get("model", "miroflow")
     request_id = f"chatcmpl-pass-{uuid.uuid4().hex[:12]}"
     created = int(time.time())
 
@@ -660,7 +614,6 @@ async def stream_passthrough(
                 headers={
                     "Authorization": f"Bearer {UPSTREAM_KEY}",
                     "Content-Type": "application/json",
-
                 },
             ) as resp:
                 if resp.status_code != 200:
@@ -796,5 +749,5 @@ async def get_logs(lines: int = 100):
 
 if __name__ == "__main__":
     import uvicorn
-    log.info("Starting Deep Research Proxy...")
+    log.info("Starting Deep Research Proxy (MiroFlow)...")
     uvicorn.run(app, host="0.0.0.0", port=LISTEN_PORT, log_level="info")
